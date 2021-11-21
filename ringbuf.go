@@ -9,6 +9,8 @@ import (
 
 var ErrOutOfRange = errors.New("out of range")
 
+// TODO @yubing ringbuffer的代码还没怎么好好看呢
+
 // Ring buffer has a fixed size, when data exceeds the
 // size, old data will be overwritten by new data.
 // It only contains the data in the stream from begin to end
@@ -115,6 +117,7 @@ func (rb *RingBuf) Slice(off, length int64) ([]byte, error) {
 	return buf, nil
 }
 
+// done，index是实际读写位置
 func (rb *RingBuf) Write(p []byte) (n int, err error) {
 	if len(p) > len(rb.data) {
 		err = ErrOutOfRange
@@ -153,6 +156,7 @@ func (rb *RingBuf) WriteAt(p []byte, off int64) (n int, err error) {
 	return
 }
 
+// seg.rb.EqualAt(key, ptr.offset+ENTRY_HDR_SIZE)
 func (rb *RingBuf) EqualAt(p []byte, off int64) bool {
 	if off+int64(len(p)) > rb.end || off < rb.begin {
 		return false
@@ -238,6 +242,7 @@ func (rb *RingBuf) Resize(newSize int) {
 	rb.index = 0
 }
 
+// 这里说明 end 和 begin都是自增的，index在 [0, len(rb.data) 之间
 func (rb *RingBuf) Skip(length int64) {
 	rb.end += length
 	rb.index += int(length)

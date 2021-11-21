@@ -13,25 +13,27 @@ var ErrLargeKey = errors.New("The key is larger than 65535")
 var ErrLargeEntry = errors.New("The entry size is larger than 1/1024 of cache size")
 var ErrNotFound = errors.New("Entry not found")
 
+// ringbuffer存储为 entryHdr + key + value
+
 // entry pointer struct points to an entry in ring buffer
 type entryPtr struct {
-	offset   int64  // entry offset in ring buffer
-	hash16   uint16 // entries are ordered by hash16 in a slot.
-	keyLen   uint16 // used to compare a key
-	reserved uint32
+	offset   int64  // 由于ringbuff就是一个字节数组，在其中定位一个kv 一个偏移量，指向entryHdr首
+	hash16   uint16 // slot中会存放多个entry。这些entry是按这里的hash16的大小排序存放的，查找时是通过二分O(log(n))查的
+	keyLen   uint16 // 该entry中存放的kv记录的key的长度，主要用于比较是否是要查找的key。
+	reserved uint32 // 对齐字段
 }
 
 // entry header struct in ring buffer, followed by key and value.
 type entryHdr struct {
-	accessTime uint32
-	expireAt   uint32
+	accessTime uint32 // 最近一次访问kv记录的时间
+	expireAt   uint32 // 超时时间
 	keyLen     uint16
-	hash16     uint16
+	hash16     uint16 // 当前entry所在slot的位置
 	valLen     uint32
-	valCap     uint32
-	deleted    bool
-	slotId     uint8
-	reserved   uint16
+	valCap     uint32 // 当前entry所能容纳的val的最大长度，如果重复写入的value小于这个值会直接在当前位置写入，否则会扩充这个value的容量
+	deleted    bool   // 为了避免不必要的内存拷贝，删除的时候并不会移动其他kv结构来覆盖当前kv，而只是通过这个标记来识别当前kv是无用的
+	slotId     uint8  // 当前entry所在的slot
+	reserved   uint16 // 对齐字段
 }
 
 // a segment contains 256 slots, a slot is an array of entry pointers ordered by hash16 value
@@ -50,7 +52,7 @@ type segment struct {
 	totalExpired  int64      // used for debug
 	overwrites    int64      // used for debug
 	touched       int64      // used for debug
-	vacuumLen     int64      // up to vacuumLen, new data can be written without overwriting old data.
+	vacuumLen     int64      // up to vacuumLen, new data can be written without overwriting old data. 剩余大小
 	slotLens      [256]int32 // The actual length for every slot.
 	slotCap       int32      // max number of entry pointers a slot can hold.
 	slotsData     []entryPtr // shared by all 256 slots
@@ -70,6 +72,7 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 	if len(key) > 65535 {
 		return ErrLargeKey
 	}
+	// TODO @yubing 为啥超过1/1024就不能写入了？
 	maxKeyValLen := len(seg.rb.data)/4 - ENTRY_HDR_SIZE
 	if len(key)+len(value) > maxKeyValLen {
 		// Do not accept large entry.
@@ -80,8 +83,10 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 	if expireSeconds > 0 {
 		expireAt = now + uint32(expireSeconds)
 	}
-
+	// segId -> hashVal[0:8]
+	// slotId -> hashVal[8:16]
 	slotId := uint8(hashVal >> 8)
+	// hash16 -> hashVal[16:32]
 	hash16 := uint16(hashVal >> 16)
 	slot := seg.getSlot(slotId)
 	idx, match := seg.lookup(slot, hash16, key)
@@ -106,6 +111,7 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 			atomic.AddInt64(&seg.overwrites, 1)
 			return
 		}
+		// 原有的value size小，不够支持当前value的填充
 		// avoid unnecessary memory copy.
 		seg.delEntryPtr(slotId, slot, idx)
 		match = false
@@ -128,7 +134,7 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 			hdr.valCap = 1
 		}
 	}
-
+	// 进入到这里，要么是新插入的值，要么 newValueSize > oldValueSize，需要新找一块儿区域去写
 	entryLen := ENTRY_HDR_SIZE + int64(len(key)) + int64(hdr.valCap)
 	slotModified := seg.evacuate(entryLen, slotId, now)
 	if slotModified {
@@ -150,6 +156,59 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 	return
 }
 
+
+// 在插入之前，先检查一遍ringbuff，是否有需要淘汰的：seg.vacuumLen < entryLen，成立则进入淘汰策略
+// 1. 优先清理已经标注为删除的：if oldHdr.deleted
+// 2. 再清理过期的：expired := oldHdr.expireAt != 0 && oldHdr.expireAt < now，
+// 3. 再根据LRU策略选择需要淘汰的entry，这个LRU的计算有点没看明白，但明确的是，越早访问的肯定越先被淘汰，
+// 4. 如果entry的淘汰算法无法得到一个合适的大小，那么就需要淘汰ringbuff中的数据，跟entry的淘汰的区别是，此处并未参考访问时间这一因素，仅仅是越早写入的越先淘汰
+// 5. 直至空闲出满足需求的空间
+
+// TODO @yubing 分配合理的空间
+func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModified bool) {
+	var oldHdrBuf [ENTRY_HDR_SIZE]byte
+	consecutiveEvacuate := 0
+	for seg.vacuumLen < entryLen {
+		// TODO 这里没有特别理解，为啥是这么计算的
+		oldOff := seg.rb.End() + seg.vacuumLen - seg.rb.Size()
+		seg.rb.ReadAt(oldHdrBuf[:], oldOff)
+		oldHdr := (*entryHdr)(unsafe.Pointer(&oldHdrBuf[0]))
+		oldEntryLen := ENTRY_HDR_SIZE + int64(oldHdr.keyLen) + int64(oldHdr.valCap)
+		if oldHdr.deleted {
+			consecutiveEvacuate = 0
+			atomic.AddInt64(&seg.totalTime, -int64(oldHdr.accessTime))
+			atomic.AddInt64(&seg.totalCount, -1)
+			seg.vacuumLen += oldEntryLen
+			continue
+		}
+		expired := oldHdr.expireAt != 0 && oldHdr.expireAt < now
+		leastRecentUsed := int64(oldHdr.accessTime)*atomic.LoadInt64(&seg.totalCount) <= atomic.LoadInt64(&seg.totalTime)
+		if expired || leastRecentUsed || consecutiveEvacuate > 5 {
+			seg.delEntryPtrByOffset(oldHdr.slotId, oldHdr.hash16, oldOff)
+			if oldHdr.slotId == slotId {
+				slotModified = true
+			}
+			consecutiveEvacuate = 0
+			atomic.AddInt64(&seg.totalTime, -int64(oldHdr.accessTime))
+			atomic.AddInt64(&seg.totalCount, -1)
+			seg.vacuumLen += oldEntryLen
+			if expired {
+				atomic.AddInt64(&seg.totalExpired, 1)
+			} else {
+				atomic.AddInt64(&seg.totalEvacuate, 1)
+			}
+		} else {
+			// evacuate an old entry that has been accessed recently for better cache hit rate.
+			newOff := seg.rb.Evacuate(oldOff, int(oldEntryLen))
+			seg.updateEntryPtr(oldHdr.slotId, oldHdr.hash16, oldOff, newOff)
+			consecutiveEvacuate++
+			atomic.AddInt64(&seg.totalEvacuate, 1)
+		}
+	}
+	return
+}
+
+// touch 更新下expireSeconds
 func (seg *segment) touch(key []byte, hashVal uint64, expireSeconds int) (err error) {
 	if len(key) > 65535 {
 		return ErrLargeKey
@@ -193,48 +252,7 @@ func (seg *segment) touch(key []byte, hashVal uint64, expireSeconds int) (err er
 	return
 }
 
-func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModified bool) {
-	var oldHdrBuf [ENTRY_HDR_SIZE]byte
-	consecutiveEvacuate := 0
-	for seg.vacuumLen < entryLen {
-		oldOff := seg.rb.End() + seg.vacuumLen - seg.rb.Size()
-		seg.rb.ReadAt(oldHdrBuf[:], oldOff)
-		oldHdr := (*entryHdr)(unsafe.Pointer(&oldHdrBuf[0]))
-		oldEntryLen := ENTRY_HDR_SIZE + int64(oldHdr.keyLen) + int64(oldHdr.valCap)
-		if oldHdr.deleted {
-			consecutiveEvacuate = 0
-			atomic.AddInt64(&seg.totalTime, -int64(oldHdr.accessTime))
-			atomic.AddInt64(&seg.totalCount, -1)
-			seg.vacuumLen += oldEntryLen
-			continue
-		}
-		expired := oldHdr.expireAt != 0 && oldHdr.expireAt < now
-		leastRecentUsed := int64(oldHdr.accessTime)*atomic.LoadInt64(&seg.totalCount) <= atomic.LoadInt64(&seg.totalTime)
-		if expired || leastRecentUsed || consecutiveEvacuate > 5 {
-			seg.delEntryPtrByOffset(oldHdr.slotId, oldHdr.hash16, oldOff)
-			if oldHdr.slotId == slotId {
-				slotModified = true
-			}
-			consecutiveEvacuate = 0
-			atomic.AddInt64(&seg.totalTime, -int64(oldHdr.accessTime))
-			atomic.AddInt64(&seg.totalCount, -1)
-			seg.vacuumLen += oldEntryLen
-			if expired {
-				atomic.AddInt64(&seg.totalExpired, 1)
-			} else {
-				atomic.AddInt64(&seg.totalEvacuate, 1)
-			}
-		} else {
-			// evacuate an old entry that has been accessed recently for better cache hit rate.
-			newOff := seg.rb.Evacuate(oldOff, int(oldEntryLen))
-			seg.updateEntryPtr(oldHdr.slotId, oldHdr.hash16, oldOff, newOff)
-			consecutiveEvacuate++
-			atomic.AddInt64(&seg.totalEvacuate, 1)
-		}
-	}
-	return
-}
-
+// 这里的buf是用户层传来的缓冲buffer，如果够就复用，不够再创建len([]byte(value))的空间，返回的value大小恒为 len([]byte(value))
 func (seg *segment) get(key, buf []byte, hashVal uint64, peek bool) (value []byte, expireAt uint32, err error) {
 	hdr, ptr, err := seg.locate(key, hashVal, peek)
 	if err != nil {
@@ -254,6 +272,7 @@ func (seg *segment) get(key, buf []byte, hashVal uint64, peek bool) (value []byt
 	return
 }
 
+// peek是否不更新统计 为false表示更新标记
 // view provides zero-copy access to the element's value, without copying to
 // an intermediate buffer.
 func (seg *segment) view(key []byte, fn func([]byte) error, hashVal uint64, peek bool) (err error) {
@@ -273,6 +292,7 @@ func (seg *segment) view(key []byte, fn func([]byte) error, hashVal uint64, peek
 	return
 }
 
+// peek是否不更新统计 为false表示更新标记
 func (seg *segment) locate(key []byte, hashVal uint64, peek bool) (hdr *entryHdr, ptr *entryPtr, err error) {
 	slotId := uint8(hashVal >> 8)
 	hash16 := uint16(hashVal >> 16)
@@ -306,6 +326,7 @@ func (seg *segment) locate(key []byte, hashVal uint64, peek bool) (hdr *entryHdr
 	return hdr, ptr, err
 }
 
+// 删key，更新deleted标记，删除索引
 func (seg *segment) del(key []byte, hashVal uint64) (affected bool) {
 	slotId := uint8(hashVal >> 8)
 	hash16 := uint16(hashVal >> 16)
@@ -318,6 +339,7 @@ func (seg *segment) del(key []byte, hashVal uint64) (affected bool) {
 	return true
 }
 
+// 按照 segId,slotId,hash16 定位对应的索引，获取offset，读取entry_header，判断剩余过期时间
 func (seg *segment) ttl(key []byte, hashVal uint64) (timeLeft uint32, err error) {
 	slotId := uint8(hashVal >> 8)
 	hash16 := uint16(hashVal >> 16)
@@ -345,6 +367,7 @@ func (seg *segment) ttl(key []byte, hashVal uint64) (timeLeft uint32, err error)
 	return
 }
 
+// 索引乘2扩容
 func (seg *segment) expand() {
 	newSlotData := make([]entryPtr, seg.slotCap*2*256)
 	for i := 0; i < 256; i++ {
@@ -355,6 +378,7 @@ func (seg *segment) expand() {
 	seg.slotsData = newSlotData
 }
 
+// 更新索引中的offset
 func (seg *segment) updateEntryPtr(slotId uint8, hash16 uint16, oldOff, newOff int64) {
 	slot := seg.getSlot(slotId)
 	idx, match := seg.lookupByOff(slot, hash16, oldOff)
@@ -365,6 +389,7 @@ func (seg *segment) updateEntryPtr(slotId uint8, hash16 uint16, oldOff, newOff i
 	ptr.offset = newOff
 }
 
+// 插入索引到slotData里，按照hash16有序
 func (seg *segment) insertEntryPtr(slotId uint8, hash16 uint16, offset int64, idx int, keyLen uint16) {
 	if seg.slotLens[slotId] == seg.slotCap {
 		seg.expand()
@@ -387,6 +412,7 @@ func (seg *segment) delEntryPtrByOffset(slotId uint8, hash16 uint16, offset int6
 	seg.delEntryPtr(slotId, slot, idx)
 }
 
+// 删entry，先更新 ringBuffer里面的deleted标记，而后去除索引slotData
 func (seg *segment) delEntryPtr(slotId uint8, slot []entryPtr, idx int) {
 	offset := slot[idx].offset
 	var entryHdrBuf [ENTRY_HDR_SIZE]byte
@@ -399,6 +425,7 @@ func (seg *segment) delEntryPtr(slotId uint8, slot []entryPtr, idx int) {
 	atomic.AddInt64(&seg.entryCount, -1)
 }
 
+// 二分找 slot[idx] >= hash16 中的idx
 func entryPtrIdx(slot []entryPtr, hash16 uint16) (idx int) {
 	high := len(slot)
 	for idx < high {
@@ -413,6 +440,7 @@ func entryPtrIdx(slot []entryPtr, hash16 uint16) (idx int) {
 	return
 }
 
+// 二分找，用keyLen做个前置校验
 func (seg *segment) lookup(slot []entryPtr, hash16 uint16, key []byte) (idx int, match bool) {
 	idx = entryPtrIdx(slot, hash16)
 	for idx < len(slot) {
@@ -473,6 +501,7 @@ func (seg *segment) clear() {
 	atomic.StoreInt64(&seg.overwrites, 0)
 }
 
+// 根据slotId获取对应slotData对应的切片
 func (seg *segment) getSlot(slotId uint8) []entryPtr {
 	slotOff := int32(slotId) * seg.slotCap
 	return seg.slotsData[slotOff : slotOff+seg.slotLens[slotId] : slotOff+seg.slotCap]
