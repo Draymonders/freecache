@@ -72,7 +72,10 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 	if len(key) > 65535 {
 		return ErrLargeKey
 	}
-	// TODO @yubing 为啥超过1/1024就不能写入了？
+	// value 超过1/1024就不能写入了？
+	// issue: https://github.com/coocood/freecache/issues/28
+	// 1. 由于value过大，写入新key，就会把这个value给逐出
+	// 2. value过大，LRU会有问题
 	maxKeyValLen := len(seg.rb.data)/4 - ENTRY_HDR_SIZE
 	if len(key)+len(value) > maxKeyValLen {
 		// Do not accept large entry.
@@ -156,20 +159,17 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 	return
 }
 
-
 // 在插入之前，先检查一遍ringbuff，是否有需要淘汰的：seg.vacuumLen < entryLen，成立则进入淘汰策略
 // 1. 优先清理已经标注为删除的：if oldHdr.deleted
 // 2. 再清理过期的：expired := oldHdr.expireAt != 0 && oldHdr.expireAt < now，
 // 3. 再根据LRU策略选择需要淘汰的entry，这个LRU的计算有点没看明白，但明确的是，越早访问的肯定越先被淘汰，
 // 4. 如果entry的淘汰算法无法得到一个合适的大小，那么就需要淘汰ringbuff中的数据，跟entry的淘汰的区别是，此处并未参考访问时间这一因素，仅仅是越早写入的越先淘汰
 // 5. 直至空闲出满足需求的空间
-
-// TODO @yubing 分配合理的空间
 func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModified bool) {
 	var oldHdrBuf [ENTRY_HDR_SIZE]byte
 	consecutiveEvacuate := 0
 	for seg.vacuumLen < entryLen {
-		// TODO 这里没有特别理解，为啥是这么计算的
+		// 等价于 seg.rb.End() - (seg.rb.Size() - seg.vacuumLen)  后者是已用的空间
 		oldOff := seg.rb.End() + seg.vacuumLen - seg.rb.Size()
 		seg.rb.ReadAt(oldHdrBuf[:], oldOff)
 		oldHdr := (*entryHdr)(unsafe.Pointer(&oldHdrBuf[0]))
